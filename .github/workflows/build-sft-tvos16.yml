@@ -1,125 +1,111 @@
-name: Build SFT tvOS16 IPA (for TrollStore)
+name: Build SFT tvOS16 IPA (legacy, Xcode 15)
+
 on:
   workflow_dispatch:
 
-env:
-  CORE_VERSION: v1.14.4         # sing-box 核心版本（与 main 分支 App 代码配套，含 CompareSemver/appVersion 等 API）
-  TVOS_TARGET: "16.1"           # 你的 Apple TV 系统版本
-
 jobs:
   build:
-    runs-on: macos-26   # Xcode 26 / Swift 6.2 工具链，libghostty-spm 新版依赖要求
+    runs-on: macos-14
     steps:
-      - name: Checkout sing-box-for-apple
+      - name: Select Xcode 15.4 (tvOS 17.5 SDK, Swift 5.10)
+        run: |
+          ls /Applications | grep Xcode
+          sudo xcode-select -s /Applications/Xcode_15.4.app
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i tvos
+
+      - name: Checkout sing-box core (v1.10.7)
         uses: actions/checkout@v4
         with:
-          submodules: recursive   # 拉取 Frameworks/Runestone 子模块，否则 SPM 解析失败
+          repository: SagerNet/sing-box
+          ref: v1.10.7
+          path: core
+
+      - name: Checkout sing-box-for-apple (2024-12-28, v1.10.6, Xcode 15 project)
+        uses: actions/checkout@v4
+        with:
+          repository: jerryyangz/sing-box-for-apple
+          ref: 3d889ae0175fb7048d1c0ba229b2ba6c069690a5
+          path: apple
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"   # sing-box v1.14.4 的 go.mod 要求 go 1.25.5
+          go-version: "1.23"
 
-      - name: Install ldid
-        run: brew install ldid
-
-      - name: Build Libbox.xcframework
+      - name: Build Libbox (tvOS slice only)
+        working-directory: core
         run: |
-          set -e
-          git clone --branch ${{ env.CORE_VERSION }} --depth 1 \
-            https://github.com/SagerNet/sing-box.git $GITHUB_WORKSPACE/core
-          export GOPROXY=https://proxy.golang.org,direct
-          # 官方 Makefile 锁定的 gomobile 版本，勿用 latest（不兼容）
-          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
-          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-          cd $GITHUB_WORKSPACE/core
-          go run ./cmd/internal/build_libbox -target apple
-          cp -rf *.xcframework $GITHUB_WORKSPACE/Libbox.xcframework
-          ls -la $GITHUB_WORKSPACE/Libbox.xcframework
+          go run ./cmd/internal/build_libbox -target apple -platform tvos/arm64
+          ls -la Libbox.xcframework
 
-      - name: Lower deployment target to tvOS ${{ env.TVOS_TARGET }}
+      - name: Place Libbox.xcframework into apple project
         run: |
-          set -e
-          # Info.plist 的 MinimumOSVersion 限制安装时的系统检查
-          plutil -replace MinimumOSVersion -string "${{ env.TVOS_TARGET }}" SFT/Info.plist
-          plutil -replace MinimumOSVersion -string "${{ env.TVOS_TARGET }}" TVExtension/Info.plist
+          cp -R core/Libbox.xcframework apple/Libbox.xcframework
 
-      - name: Patch out AutoRedirect (core v1.14.4 lacks these types)
+      - name: Archive SFT (unsigned, tvOS 16.1 target)
+        working-directory: apple
         run: |
-          set -e
-          python3 - <<'EOF'
-          import re
-          p = 'Library/Network/ExtensionPlatformInterface.swift'
-          s = open(p).read()
-          pat = re.compile(r'\n    public func createAutoRedirect\([^{]*\{[^}]*\}\n', re.S)
-          s2 = pat.sub('\n', s, count=1)
-          assert s2 != s, 'patch failed: createAutoRedirect not found'
-          open(p, 'w').write(s2)
-          print('patched: createAutoRedirect removed')
-          EOF
-
-      - name: Xcode Archive (tvOS, unsigned)
-        run: |
-          set -e
           xcodebuild archive \
-            -project sing-box.xcodeproj \
             -scheme SFT \
             -configuration Release \
             -destination 'generic/platform=tvOS' \
             -archivePath build/SFT.xcarchive \
-            TVOS_DEPLOYMENT_TARGET=${{ env.TVOS_TARGET }} \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            TVOS_DEPLOYMENT_TARGET=16.1 \
+            MARKETING_VERSION=1.10.6 \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking'
+            DISABLE_SWIFTLINT=1 \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            | tee archive.log || { tail -60 archive.log; exit 1; }
 
-      - name: Inject entitlements (ldid, TrollStore preserves them)
+      - name: Assemble IPA payload
         run: |
-          set -e
-          APP_PATH=$(find build/SFT.xcarchive -name "sing-box.app" | head -n 1)
-          EXT_PATH="$APP_PATH/PlugIns/TVExtension.appex"
+          APP="apple/build/SFT.xcarchive/Products/Applications/sing-box.app"
+          test -d "$APP"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          # ldid: 注入 entitlements 并 fakesign（TrollStore 保留 entitlements）
+          brew install ldid
+          ENT_APP="apple/SFT/SFT.entitlements"
+          ENT_EXT="apple/TVExtension/TVExtension.entitlements"
+          test -f "$ENT_APP"
+          test -f "$ENT_EXT"
+          ldid -S"$ENT_EXT" "ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/TVExtension"
+          FWLIB=$(find ipa/Payload/sing-box.app -name "Library" -path "*Library.framework*" -type f)
+          ldid -S "ipa/Payload/sing-box.app/Frameworks/Library.framework" 2>/dev/null || true
+          ldid -S "$FWLIB"
+          ldid -S"$ENT_APP" "ipa/Payload/sing-box.app/sing-box"
+          echo "--- entitlements check (app) ---"
+          ldid -e "ipa/Payload/sing-box.app/sing-box" || true
+          echo "--- entitlements check (ext) ---"
+          ldid -e "ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/TVExtension" || true
 
-          # App 本体：app group + keychain 共享
-          cat > app.entitlements <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>com.apple.security.application-groups</key>
-            <array><string>group.io.nekohasekai.sfi</string></array>
-          </dict></plist>
-          EOF
-
-          # 隧道扩展：packet-tunnel-provider + app group
-          cat > ext.entitlements <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>com.apple.developer.networking.networkextension</key>
-            <array><string>packet-tunnel-provider</string></array>
-            <key>com.apple.security.application-groups</key>
-            <array><string>group.io.nekohasekai.sfi</string></array>
-          </dict></plist>
-          EOF
-
-          ldid -Sapp.entitlements "$APP_PATH/sing-box"
-          ldid -Sext.entitlements "$EXT_PATH/TVExtension"
-          # 框架内的二进制也做 fakesign，避免运行时签名校验失败
-          find "$APP_PATH" -name "*.framework" -type d | while read -r fw; do
-            BIN_NAME=$(basename "$fw" .framework)
-            [ -f "$fw/$BIN_NAME" ] && ldid -S "$fw/$BIN_NAME" || true
-          done
-
-      - name: Package IPA
+      - name: Pack IPA (python zipfile, standard structure)
         run: |
-          set -e
-          mkdir -p Payload
-          APP_PATH=$(find build/SFT.xcarchive -name "sing-box.app" | head -n 1)
-          cp -rp "$APP_PATH" Payload/
-          zip -qry sing-box-tvos16.ipa Payload
-          ls -la sing-box-tvos16.ipa
+          /usr/bin/python3 - <<'PY'
+          import zipfile, os
+          out = 'sing-box-tvos16-legacy.ipa'
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for root, dirs, files in os.walk('ipa/Payload'):
+                  dirs.sort(); files.sort()
+                  for d in dirs:
+                      p = os.path.join(root, d)
+                      zi = zipfile.ZipInfo(p + '/')
+                      zi.external_attr = (0o40755 << 16) | 0x10
+                      z.writestr(zi, b'')
+                  for f in files:
+                      p = os.path.join(root, f)
+                      z.write(p, p)
+          print('packed', out, os.path.getsize(out))
+          PY
 
-      - name: Upload Artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-tvos16-trollstore
-          path: sing-box-tvos16.ipa
+          name: sing-box-tvos16-legacy
+          path: sing-box-tvos16-legacy.ipa
