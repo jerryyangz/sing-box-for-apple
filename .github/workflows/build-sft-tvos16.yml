@@ -3,12 +3,12 @@ on:
   workflow_dispatch:
 
 env:
-  CORE_VERSION: v1.12.14        # sing-box 核心版本（与 main 分支 App 代码配套）
+  CORE_VERSION: v1.14.4         # sing-box 核心版本（与 main 分支 App 代码配套，含 CompareSemver/appVersion 等 API）
   TVOS_TARGET: "16.1"           # 你的 Apple TV 系统版本
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-26   # Xcode 26 / Swift 6.2 工具链，libghostty-spm 新版依赖要求
     steps:
       - name: Checkout sing-box-for-apple
         uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"   # sing-box v1.14.4 的 go.mod 要求 go 1.25.5
 
       - name: Install ldid
         run: brew install ldid
@@ -30,8 +30,8 @@ jobs:
             https://github.com/SagerNet/sing-box.git $GITHUB_WORKSPACE/core
           export GOPROXY=https://proxy.golang.org,direct
           # 官方 Makefile 锁定的 gomobile 版本，勿用 latest（不兼容）
-          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.8
-          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.8
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           cd $GITHUB_WORKSPACE/core
           go run ./cmd/internal/build_libbox -target apple
