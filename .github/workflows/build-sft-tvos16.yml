@@ -27,12 +27,12 @@ jobs:
           git clone --branch ${{ env.CORE_VERSION }} --depth 1 \
             https://github.com/SagerNet/sing-box.git $GITHUB_WORKSPACE/core
           export GOPROXY=https://proxy.golang.org,direct
-          go install github.com/sagernet/gomobile/cmd/gomobile@latest
-          go install github.com/sagernet/gomobile/cmd/gobind@latest
+          # 官方 Makefile 锁定的 gomobile 版本，勿用 latest（不兼容）
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.8
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.8
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-          $(go env GOPATH)/bin/gomobile init
           cd $GITHUB_WORKSPACE/core
-          go run ./cmd/apple framework -v
+          go run ./cmd/internal/build_libbox -target apple
           cp -rf *.xcframework $GITHUB_WORKSPACE/Libbox.xcframework
           ls -la $GITHUB_WORKSPACE/Libbox.xcframework
 
