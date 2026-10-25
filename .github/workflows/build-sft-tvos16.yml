@@ -1,0 +1,109 @@
+name: Build SFT tvOS16 IPA (for TrollStore)
+on:
+  workflow_dispatch:
+
+env:
+  CORE_VERSION: v1.12.14        # sing-box 核心版本（与 main 分支 App 代码配套）
+  TVOS_TARGET: "16.1"           # 你的 Apple TV 系统版本
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout sing-box-for-apple
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build Libbox.xcframework
+        run: |
+          set -e
+          git clone --branch ${{ env.CORE_VERSION }} --depth 1 \
+            https://github.com/SagerNet/sing-box.git $GITHUB_WORKSPACE/core
+          export GOPROXY=https://proxy.golang.org,direct
+          go install github.com/sagernet/gomobile/cmd/gomobile@latest
+          go install github.com/sagernet/gomobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          $(go env GOPATH)/bin/gomobile init
+          cd $GITHUB_WORKSPACE/core
+          go run ./cmd/apple framework -v
+          cp -rf *.xcframework $GITHUB_WORKSPACE/Libbox.xcframework
+          ls -la $GITHUB_WORKSPACE/Libbox.xcframework
+
+      - name: Lower deployment target to tvOS ${{ env.TVOS_TARGET }}
+        run: |
+          set -e
+          # Info.plist 的 MinimumOSVersion 限制安装时的系统检查
+          plutil -replace MinimumOSVersion -string "${{ env.TVOS_TARGET }}" SFT/Info.plist
+          plutil -replace MinimumOSVersion -string "${{ env.TVOS_TARGET }}" TVExtension/Info.plist
+
+      - name: Xcode Archive (tvOS, unsigned)
+        run: |
+          set -e
+          xcodebuild archive \
+            -project sing-box.xcodeproj \
+            -scheme SFT \
+            -configuration Release \
+            -destination 'generic/platform=tvOS' \
+            -archivePath build/SFT.xcarchive \
+            TVOS_DEPLOYMENT_TARGET=${{ env.TVOS_TARGET }} \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            FRAMEWORK_SEARCH_PATHS="$(pwd)"
+
+      - name: Inject entitlements (ldid, TrollStore preserves them)
+        run: |
+          set -e
+          APP_PATH=$(find build/SFT.xcarchive -name "sing-box.app" | head -n 1)
+          EXT_PATH="$APP_PATH/PlugIns/TVExtension.appex"
+
+          # App 本体：app group + keychain 共享
+          cat > app.entitlements <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.security.application-groups</key>
+            <array><string>group.io.nekohasekai.sfi</string></array>
+          </dict></plist>
+          EOF
+
+          # 隧道扩展：packet-tunnel-provider + app group
+          cat > ext.entitlements <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.developer.networking.networkextension</key>
+            <array><string>packet-tunnel-provider</string></array>
+            <key>com.apple.security.application-groups</key>
+            <array><string>group.io.nekohasekai.sfi</string></array>
+          </dict></plist>
+          EOF
+
+          ldid -Sapp.entitlements "$APP_PATH/sing-box"
+          ldid -Sext.entitlements "$EXT_PATH/TVExtension"
+          # 框架内的二进制也做 fakesign，避免运行时签名校验失败
+          find "$APP_PATH" -name "*.framework" -type d | while read -r fw; do
+            BIN_NAME=$(basename "$fw" .framework)
+            [ -f "$fw/$BIN_NAME" ] && ldid -S "$fw/$BIN_NAME" || true
+          done
+
+      - name: Package IPA
+        run: |
+          set -e
+          mkdir -p Payload
+          APP_PATH=$(find build/SFT.xcarchive -name "sing-box.app" | head -n 1)
+          cp -rp "$APP_PATH" Payload/
+          zip -qry sing-box-tvos16.ipa Payload
+          ls -la sing-box-tvos16.ipa
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-tvos16-trollstore
+          path: sing-box-tvos16.ipa
