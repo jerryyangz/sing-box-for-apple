@@ -45,6 +45,20 @@ jobs:
           plutil -replace MinimumOSVersion -string "${{ env.TVOS_TARGET }}" SFT/Info.plist
           plutil -replace MinimumOSVersion -string "${{ env.TVOS_TARGET }}" TVExtension/Info.plist
 
+      - name: Patch out AutoRedirect (core v1.14.4 lacks these types)
+        run: |
+          set -e
+          python3 - <<'EOF'
+          import re
+          p = 'Library/Network/ExtensionPlatformInterface.swift'
+          s = open(p).read()
+          pat = re.compile(r'\n    public func createAutoRedirect\([^{]*\{[^}]*\}\n', re.S)
+          s2 = pat.sub('\n', s, count=1)
+          assert s2 != s, 'patch failed: createAutoRedirect not found'
+          open(p, 'w').write(s2)
+          print('patched: createAutoRedirect removed')
+          EOF
+
       - name: Xcode Archive (tvOS, unsigned)
         run: |
           set -e
@@ -56,7 +70,8 @@ jobs:
             -archivePath build/SFT.xcarchive \
             TVOS_DEPLOYMENT_TARGET=${{ env.TVOS_TARGET }} \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO \
+            OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking'
 
       - name: Inject entitlements (ldid, TrollStore preserves them)
         run: |
