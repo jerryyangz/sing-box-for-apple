@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout sing-box-for-apple
         uses: actions/checkout@v4
+        with:
+          submodules: recursive   # 拉取 Frameworks/Runestone 子模块，否则 SPM 解析失败
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -54,8 +56,7 @@ jobs:
             -archivePath build/SFT.xcarchive \
             TVOS_DEPLOYMENT_TARGET=${{ env.TVOS_TARGET }} \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            FRAMEWORK_SEARCH_PATHS="$(pwd)"
+            CODE_SIGNING_REQUIRED=NO
 
       - name: Inject entitlements (ldid, TrollStore preserves them)
         run: |
