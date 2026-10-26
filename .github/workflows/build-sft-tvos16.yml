@@ -36,6 +36,9 @@ jobs:
       - name: Build Libbox (tvOS slice only)
         working-directory: core
         run: |
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile version || true
           go run ./cmd/internal/build_libbox -target apple -platform tvos/arm64
           ls -la Libbox.xcframework
 
