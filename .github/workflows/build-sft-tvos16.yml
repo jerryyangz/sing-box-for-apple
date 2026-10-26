@@ -48,7 +48,9 @@ jobs:
 
       - name: Archive SFT (unsigned, tvOS 16.1 target)
         working-directory: apple
+        shell: bash
         run: |
+          set -euo pipefail
           xcodebuild archive \
             -scheme SFT \
             -configuration Release \
@@ -68,8 +70,16 @@ jobs:
 
       - name: Assemble IPA payload
         run: |
+          set -euo pipefail
           APP="apple/build/SFT.xcarchive/Products/Applications/sing-box.app"
-          test -d "$APP"
+          if [ ! -d "$APP" ]; then
+            echo "!! expected app not found: $APP"
+            echo "--- archive contents ---"
+            find apple/build -maxdepth 5 | head -60 || true
+            echo "--- tail of archive.log ---"
+            tail -80 apple/archive.log || true
+            exit 1
+          fi
           mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
           # ldid: 注入 entitlements 并 fakesign（TrollStore 保留 entitlements）
@@ -80,7 +90,8 @@ jobs:
           test -f "$ENT_EXT"
           ldid -S"$ENT_EXT" "ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/TVExtension"
           FWLIB=$(find ipa/Payload/sing-box.app -name "Library" -path "*Library.framework*" -type f)
-          ldid -S "ipa/Payload/sing-box.app/Frameworks/Library.framework" 2>/dev/null || true
+          echo "FWLIB=$FWLIB"
+          test -n "$FWLIB"
           ldid -S "$FWLIB"
           ldid -S"$ENT_APP" "ipa/Payload/sing-box.app/sing-box"
           echo "--- entitlements check (app) ---"
