@@ -1,0 +1,296 @@
+name: Build SFT tvOS16 IPA (legacy, Xcode 15)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Select Xcode 15.4 (tvOS 17.5 SDK, Swift 5.10)
+        run: |
+          ls /Applications | grep Xcode
+          sudo xcode-select -s /Applications/Xcode_15.4.app
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i tvos
+
+      - name: Checkout sing-box core (v1.10.7)
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: v1.10.7
+          path: core
+
+      - name: Checkout sing-box-for-apple (2024-12-28, v1.10.6, Xcode 15 project)
+        uses: actions/checkout@v4
+        with:
+          repository: jerryyangz/sing-box-for-apple
+          ref: 3d889ae0175fb7048d1c0ba229b2ba6c069690a5
+          path: apple
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build Libbox (tvOS slice only)
+        working-directory: core
+        run: |
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile version || true
+          go run ./cmd/internal/build_libbox -target apple -platform tvos/arm64
+          ls -la Libbox.xcframework
+
+      - name: Place Libbox.xcframework into apple project
+        run: |
+          cp -R core/Libbox.xcframework apple/Libbox.xcframework
+
+      - name: Patch client to install bundled rule-set into working directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+
+          def edit(path, old, new, label):
+              p = pathlib.Path(path)
+              s = p.read_text(encoding='utf-8')
+              if new in s:
+                  print('already patched:', label)
+                  return
+              assert old in s, 'anchor missing: ' + label
+              p.write_text(s.replace(old, new, 1), encoding='utf-8')
+              print('patched:', label)
+
+          helper = '\n'.join([
+              '',
+              'public extension FilePath {',
+              '    /// \u628a App / \u6269\u5c55\u5305\u91cc\u5185\u7f6e\u7684\u89c4\u5219\u96c6\u590d\u5236\u5230\u5de5\u4f5c\u76ee\u5f55',
+              '    static func installBundledRuleSets() {',
+              '        let fileManager = FileManager.default',
+              '        let directory = workingDirectory',
+              '        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)',
+              '        guard let source = Bundle.main.url(forResource: "geoip-cn", withExtension: "srs") else {',
+              '            return',
+              '        }',
+              '        let destination = directory.appendingPathComponent("geoip-cn.srs")',
+              '        try? fileManager.removeItem(at: destination)',
+              '        try? fileManager.copyItem(at: source, to: destination)',
+              '    }',
+              '}',
+              '',
+          ])
+
+          fp = pathlib.Path('apple/Library/Shared/FilePath.swift')
+          s = fp.read_text(encoding='utf-8')
+          if 'installBundledRuleSets' not in s:
+              fp.write_text(s.rstrip('\n') + '\n' + helper, encoding='utf-8')
+              print('patched: FilePath.swift (append helper)')
+
+          edit('apple/Library/Network/ExtensionProvider.swift',
+               '    private func startService() async {\n        let profile: Profile?\n',
+               '    private func startService() async {\n        FilePath.installBundledRuleSets()\n        let profile: Profile?\n',
+               'ExtensionProvider.swift')
+
+          edit('apple/SFT/ApplicationDelegate.swift',
+               '        LibboxSetup(options, &error)\n        LibboxSetLocale(Locale.current.identifier)',
+               '        LibboxSetup(options, &error)\n        FilePath.installBundledRuleSets()\n        LibboxSetLocale(Locale.current.identifier)',
+               'SFT/ApplicationDelegate.swift')
+
+          # 4) 修复 tvOS 16 点日志页闪退：focusEffectDisabled 是 tvOS 17 API
+          lv = pathlib.Path('apple/ApplicationLibrary/Views/Log/LogView.swift')
+          s = lv.read_text(encoding='utf-8')
+          if 'focusEffectDisabledCompat' not in s:
+              n = s.count('.focusEffectDisabled()')
+              assert n == 2, 'focusEffectDisabled count unexpected: ' + str(n)
+              lv.write_text(s.replace('.focusEffectDisabled()', '.focusEffectDisabledCompat()'), encoding='utf-8')
+              print('patched: LogView.swift (focusEffectDisabled -> compat)')
+
+          vc = pathlib.Path('apple/ApplicationLibrary/Views/Abstract/ViewCompat.swift')
+          s = vc.read_text(encoding='utf-8')
+          if 'focusEffectDisabledCompat' not in s:
+              if 'import Foundation' not in s:
+                  s = s.replace('import SwiftUI', 'import Foundation\nimport SwiftUI', 1)
+              helper = '\n'.join([
+                  '',
+                  'public extension View {',
+                  '    /// focusEffectDisabled \u662f tvOS 17 API\uff0c\u65e7\u7cfb\u7edf\u4e0a\u6309\u8fd0\u884c\u65f6\u7248\u672c\u8df3\u8fc7',
+                  '    @ViewBuilder',
+                  '    func focusEffectDisabledCompat() -> some View {',
+                  '        if ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 17, minorVersion: 0, patchVersion: 0)) {',
+                  '            focusEffectDisabled()',
+                  '        } else {',
+                  '            self',
+                  '        }',
+                  '    }',
+                  '}',
+                  '',
+              ])
+              vc.write_text(s.rstrip('\n') + '\n' + helper, encoding='utf-8')
+              print('patched: ViewCompat.swift (add focusEffectDisabledCompat)')
+
+          print('done')
+          PY
+          echo "--- patch check ---"
+          grep -c "installBundledRuleSets" apple/Library/Shared/FilePath.swift apple/Library/Network/ExtensionProvider.swift apple/SFT/ApplicationDelegate.swift
+          grep -c "focusEffectDisabledCompat" apple/ApplicationLibrary/Views/Log/LogView.swift apple/ApplicationLibrary/Views/Abstract/ViewCompat.swift
+          swiftc -typecheck apple/Library/Shared/FilePath.swift
+          swiftc -typecheck apple/ApplicationLibrary/Views/Abstract/ViewCompat.swift
+
+      - name: Archive SFT (unsigned, tvOS 16.1 target)
+        working-directory: apple
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -scheme SFT \
+            -configuration Release \
+            -destination 'generic/platform=tvOS' \
+            -archivePath build/SFT.xcarchive \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            TVOS_DEPLOYMENT_TARGET=16.1 \
+            MARKETING_VERSION=1.10.6 \
+            OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking' \
+            OTHER_LDFLAGS='$(inherited) -weak_framework _DeviceDiscoveryUI_SwiftUI' \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO \
+            GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            DISABLE_SWIFTLINT=1 \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            | tee archive.log || {
+              echo "===== COMPILE ERRORS ====="
+              grep -E "error:" archive.log | head -40 || true
+              echo "===== TAIL ====="
+              tail -60 archive.log
+              exit 1
+            }
+
+      - name: Compile geoip-cn rule-set (APNIC -> .srs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd core && go build -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box)
+          for i in $(seq 1 12); do
+            curl -sL --max-time 90 -C - "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest" -o apnic.txt || true
+            SZ=$(stat -f%z apnic.txt 2>/dev/null || echo 0)
+            echo "apnic attempt $i size=$SZ"
+            if [ "$SZ" -gt 3000000 ]; then break; fi
+            sleep 2
+          done
+          python3 - <<'PY'
+          import ipaddress, json
+          nets=[]
+          for line in open('apnic.txt', errors='ignore'):
+              p=line.strip().split('|')
+              if len(p)<5 or p[1]!='CN' or p[2]!='ipv4': continue
+              s=ipaddress.IPv4Address(p[3]); c=int(p[4])
+              nets.extend(ipaddress.summarize_address_range(s, ipaddress.IPv4Address(int(s)+c-1)))
+          cidrs=[str(n) for n in ipaddress.collapse_addresses(nets)]
+          json.dump({'version':1,'rules':[{'ip_cidr':cidrs}]}, open('geoip-cn.json','w'), ensure_ascii=False)
+          print('CN CIDR count:', len(cidrs))
+          PY
+          "$RUNNER_TEMP/sing-box" rule-set compile geoip-cn.json -o geoip-cn.srs
+          ls -la geoip-cn.srs
+
+      - name: Assemble IPA payload
+        run: |
+          set -euo pipefail
+          APP="apple/build/SFT.xcarchive/Products/Applications/sing-box.app"
+          if [ ! -d "$APP" ]; then
+            echo "!! expected app not found: $APP"
+            echo "--- archive contents ---"
+            find apple/build -maxdepth 5 | head -60 || true
+            echo "--- tail of archive.log ---"
+            tail -80 apple/archive.log || true
+            exit 1
+          fi
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          # 规则集打进主 App 与扩展包，启动时由 Swift 侧复制到 Working 工作目录
+          test -f geoip-cn.srs
+          cp geoip-cn.srs ipa/Payload/sing-box.app/
+          cp geoip-cn.srs ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/
+          ls -la ipa/Payload/sing-box.app/geoip-cn.srs ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/geoip-cn.srs
+          # ldid: 注入 entitlements 并 fakesign（TrollStore 保留 entitlements）
+          brew install ldid
+          ENT_APP="apple/SFT/SFT.entitlements"
+          ENT_EXT="apple/TVExtension/TVExtension.entitlements"
+          test -f "$ENT_APP"
+          test -f "$ENT_EXT"
+          ldid -S"$ENT_EXT" "ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/TVExtension"
+          FWLIB=$(find ipa/Payload/sing-box.app -name "Library" -path "*Library.framework*" -type f)
+          echo "FWLIB=$FWLIB"
+          test -n "$FWLIB"
+          ldid -S "$FWLIB"
+          ldid -S"$ENT_APP" "ipa/Payload/sing-box.app/sing-box"
+          echo "--- entitlements check (app) ---"
+          ldid -e "ipa/Payload/sing-box.app/sing-box" || true
+          echo "--- entitlements check (ext) ---"
+          ldid -e "ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/TVExtension" || true
+
+      - name: Verify archive (minos / weak link)
+        run: |
+          set -euo pipefail
+          BIN="ipa/Payload/sing-box.app/sing-box"
+          echo "--- LC_BUILD_VERSION ---"
+          otool -l "$BIN" | grep -A4 LC_BUILD_VERSION | head -6
+          echo "--- dylib 加载命令(weak 检查) ---"
+          /usr/bin/python3 - "$BIN" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], 'rb').read()
+          ncmds = struct.unpack_from('<I', data, 16)[0]
+          pos, weak, strong = 32, [], []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from('<II', data, pos)
+              if cmd in (0xc, 0x18):
+                  off = struct.unpack_from('<I', data, pos + 8)[0]
+                  end = data.find(b'\x00', pos + off)
+                  name = data[pos + off:end].decode('utf-8', 'replace').split('/')[-1]
+                  (weak if cmd == 0x18 else strong).append(name)
+              pos += cmdsize
+          print('weak:', weak)
+          print('strong:', strong)
+          assert '_DeviceDiscoveryUI_SwiftUI' in weak, 'DeviceDiscovery 未 weak link'
+          print('OK: DeviceDiscovery 已弱链')
+          PY
+          echo "--- 规则集打包检查 ---"
+          test -f ipa/Payload/sing-box.app/geoip-cn.srs
+          test -f ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/geoip-cn.srs
+          ls -la ipa/Payload/sing-box.app/geoip-cn.srs ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/geoip-cn.srs
+          echo "--- 规则集格式检查（应为 SRS 二进制魔数）---"
+          head -c 3 ipa/Payload/sing-box.app/geoip-cn.srs | xxd
+
+      - name: Pack IPA (python zipfile, standard structure)
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import zipfile, os
+          out = 'sing-box-tvos16-legacy.ipa'
+          root_dir = 'ipa'
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for root, dirs, files in os.walk(os.path.join(root_dir, 'Payload')):
+                  dirs.sort(); files.sort()
+                  for d in dirs:
+                      p = os.path.join(root, d)
+                      arc = os.path.relpath(p, root_dir) + '/'
+                      zi = zipfile.ZipInfo(arc)
+                      zi.external_attr = (0o40755 << 16) | 0x10
+                      z.writestr(zi, b'')
+                  for f in files:
+                      p = os.path.join(root, f)
+                      arc = os.path.relpath(p, root_dir)
+                      z.write(p, arc)
+          names = zipfile.ZipFile(out).namelist()
+          assert names[0].startswith('Payload/sing-box.app'), names[:3]
+          print('packed', out, os.path.getsize(out), 'entries', len(names))
+          PY
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-tvos16-legacy
+          path: sing-box-tvos16-legacy.ipa
