@@ -233,6 +233,49 @@ jobs:
           echo "--- entitlements check (ext) ---"
           ldid -e "ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/TVExtension" || true
 
+      - name: Patch DeviceDiscovery to weak link (LC_LOAD_WEAK_DYLIB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import os, struct
+          # ld64 的 -weak_framework 对该库未生效（SDK 里不存在此 framework，仍输出强链接
+          # LC_LOAD_DYLIB）。原地把命令类型改为 LC_LOAD_WEAK_DYLIB = 0x18|0x80000000
+          # = 0x80000018，ordinal 总数不变，chained fixups 安全。
+          patched, already = [], []
+          for root, dirs, files in os.walk('ipa/Payload'):
+              for f in files:
+                  p = os.path.join(root, f)
+                  with open(p, 'rb') as fh:
+                      data = bytearray(fh.read())
+                  if len(data) < 40 or struct.unpack_from('<I', data, 0)[0] != 0xfeedfacf:
+                      continue
+                  ncmds = struct.unpack_from('<I', data, 16)[0]
+                  pos = 32
+                  changed = False
+                  for _ in range(ncmds):
+                      cmd, cmdsize = struct.unpack_from('<II', data, pos)
+                      if cmd in (0xc, 0x18, 0x80000018):
+                          off = struct.unpack_from('<I', data, pos + 8)[0]
+                          end = data.find(b'\x00', pos + off)
+                          name = bytes(data[pos + off:end]).decode('utf-8', 'replace')
+                          if '_DeviceDiscoveryUI_SwiftUI' in name:
+                              if cmd == 0xc:
+                                  struct.pack_into('<I', data, pos, 0x80000018)
+                                  changed = True
+                                  patched.append(p)
+                              else:
+                                  already.append(p)
+                      pos += cmdsize
+                  if changed:
+                      with open(p, 'wb') as fh:
+                          fh.write(data)
+          print('patched strong->weak:', patched)
+          print('already weak:', already)
+          if not patched and not already:
+              print('NOTE: binary has no _DeviceDiscoveryUI_SwiftUI reference at all - nothing to patch, safe')
+          PY
+
       - name: Verify archive (minos / weak link)
         run: |
           set -euo pipefail
@@ -242,21 +285,22 @@ jobs:
           echo "--- dylib 加载命令(weak 检查) ---"
           /usr/bin/python3 - "$BIN" <<'PY'
           import struct, sys
+          # LC_LOAD_DYLIB=0xc, LC_LOAD_WEAK_DYLIB=0x18|LC_REQ_DYLD=0x80000018
           data = open(sys.argv[1], 'rb').read()
           ncmds = struct.unpack_from('<I', data, 16)[0]
           pos, weak, strong = 32, [], []
           for _ in range(ncmds):
               cmd, cmdsize = struct.unpack_from('<II', data, pos)
-              if cmd in (0xc, 0x18):
+              if cmd in (0xc, 0x18, 0x80000018):
                   off = struct.unpack_from('<I', data, pos + 8)[0]
                   end = data.find(b'\x00', pos + off)
                   name = data[pos + off:end].decode('utf-8', 'replace').split('/')[-1]
-                  (weak if cmd == 0x18 else strong).append(name)
+                  (strong if cmd == 0xc else weak).append(name)
               pos += cmdsize
           print('weak:', weak)
           print('strong:', strong)
-          assert '_DeviceDiscoveryUI_SwiftUI' in weak, 'DeviceDiscovery 未 weak link'
-          print('OK: DeviceDiscovery 已弱链')
+          assert '_DeviceDiscoveryUI_SwiftUI' not in strong, 'DeviceDiscovery 仍是强链接，tvOS 16.1 无法启动'
+          print('OK: DeviceDiscovery 无强链接 (weak=%s)' % ('_DeviceDiscoveryUI_SwiftUI' in weak))
           PY
           echo "--- 规则集打包检查 ---"
           test -f ipa/Payload/sing-box.app/geoip-cn.srs
