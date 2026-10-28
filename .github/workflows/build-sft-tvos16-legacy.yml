@@ -460,7 +460,10 @@ jobs:
           fi
           echo "OK: 主二进制已无 focusEffectDisabled 引用"
           echo "--- 设置页二维码横幅（关注一三羊）---"
-          HIT3=$(grep -r -a -l "感谢支持" ipa/Payload || true)
+          # 注意：macos-14 runner 的 BSD grep 按 UTF-8 locale 逐行解码，
+          # Mach-O 二进制含大量非法 UTF-8 序列，多字节模式（中文）会失配；
+          # 必须 LC_ALL=C 强制按字节匹配（ASCII 模式如 Logs (connected) 不受影响）
+          HIT3=$(LC_ALL=C grep -r -a -l "感谢支持" ipa/Payload || true)
           echo "命中文件: ${HIT3:-<none>}"
           test -n "$HIT3" || { echo "!! 设置页横幅未编进二进制"; exit 1; }
           NQR=$(grep -a -o "iVBORw0KGgo" ipa/Payload/sing-box.app/sing-box | wc -l | tr -d ' ')
