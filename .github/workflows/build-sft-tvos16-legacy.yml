@@ -294,6 +294,10 @@ jobs:
           if 'SponsorQrBanner' in s:
               print('already patched: SettingView.swift')
           else:
+              # 显式引入 UIKit / Foundation，不依赖 SwiftUI 的 re-export（tvOS 上 UIImage 必须可用）
+              if 'import UIKit' not in s:
+                  s = s.replace('import SwiftUI', '#if canImport(UIKit)\nimport UIKit\n#endif\nimport SwiftUI', 1)
+                  print('import UIKit added')
               anchor = '            Section("Debug") {'
               assert anchor in s, 'anchor missing: Section("Debug")'
               idx = s.index(anchor)
@@ -303,6 +307,7 @@ jobs:
           PY
           echo "--- sponsor patch check ---"
           grep -q "SponsorQrBanner" apple/ApplicationLibrary/Views/Setting/SettingView.swift
+          grep -q "import UIKit" apple/ApplicationLibrary/Views/Setting/SettingView.swift
           grep -q "关注一三羊" apple/ApplicationLibrary/Views/Setting/SettingView.swift
           grep -q "感谢支持" apple/ApplicationLibrary/Views/Setting/SettingView.swift
           swiftc -parse apple/ApplicationLibrary/Views/Setting/SettingView.swift
