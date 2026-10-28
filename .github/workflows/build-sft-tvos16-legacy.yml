@@ -46,7 +46,7 @@ jobs:
         run: |
           cp -R core/Libbox.xcframework apple/Libbox.xcframework
 
-      - name: Patch client to install bundled rule-set into working directory
+      - name: Patch client (fix tvOS 16 log page crash)
         shell: bash
         run: |
           set -euo pipefail
@@ -63,80 +63,74 @@ jobs:
               p.write_text(s.replace(old, new, 1), encoding='utf-8')
               print('patched:', label)
 
-          helper = '\n'.join([
+          # 1) 修复 tvOS 16 点日志页闪退：整页换成只用 tvOS 13 级别 API 的实现
+          #    去掉 focusEffectDisabled(tvOS 17)、ScrollViewReader、LazyVGrid、
+          #    focusable/focusSection、动态 Range 的 ForEach
+          lv = pathlib.Path('apple/ApplicationLibrary/Views/Log/LogView.swift')
+          lv.write_text('\n'.join([
+              'import Library',
+              'import SwiftUI',
               '',
-              'public extension FilePath {',
-              '    /// \u628a App / \u6269\u5c55\u5305\u91cc\u5185\u7f6e\u7684\u89c4\u5219\u96c6\u590d\u5236\u5230\u5de5\u4f5c\u76ee\u5f55',
-              '    static func installBundledRuleSets() {',
-              '        let fileManager = FileManager.default',
-              '        let directory = workingDirectory',
-              '        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)',
-              '        guard let source = Bundle.main.url(forResource: "geoip-cn", withExtension: "srs") else {',
-              '            return',
-              '        }',
-              '        let destination = directory.appendingPathComponent("geoip-cn.srs")',
-              '        try? fileManager.removeItem(at: destination)',
-              '        try? fileManager.copyItem(at: source, to: destination)',
+              'public struct LogView: View {',
+              '    @EnvironmentObject private var environments: ExtensionEnvironments',
+              '',
+              '    public init() {}',
+              '',
+              '    public var body: some View {',
+              '        LogPage(logClient: environments.logClient)',
               '    }',
               '}',
               '',
-          ])
+              'private struct LogPage: View {',
+              '    @ObservedObject var logClient: CommandClient',
+              '',
+              '    private let logFont = Font.system(.caption2, design: .monospaced)',
+              '',
+              '    private var lines: [String] {',
+              '        Array(logClient.logList.reversed())',
+              '    }',
+              '',
+              '    var body: some View {',
+              '        VStack(alignment: .leading, spacing: 6) {',
+              '            Text(logClient.isConnected ? "Logs (connected)" : "Logs (service not started)")',
+              '                .font(.caption)',
+              '            ScrollView {',
+              '                VStack(alignment: .leading, spacing: 2) {',
+              '                    ForEach(Array(lines.enumerated()), id: \\.offset) { item in',
+              '                        Text(item.element)',
+              '                            .font(logFont)',
+              '                            .frame(maxWidth: .infinity, alignment: .leading)',
+              '                    }',
+              '                }',
+              '                .padding()',
+              '            }',
+              '        }',
+              '        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)',
+              '        .padding()',
+              '    }',
+              '}',
+              '',
+          ]), encoding='utf-8')
+          print('rewritten: LogView.swift (tvOS 13-safe minimal implementation)')
 
-          fp = pathlib.Path('apple/Library/Shared/FilePath.swift')
-          s = fp.read_text(encoding='utf-8')
-          if 'installBundledRuleSets' not in s:
-              fp.write_text(s.rstrip('\n') + '\n' + helper, encoding='utf-8')
-              print('patched: FilePath.swift (append helper)')
+          # 2) CommandClient 去掉强制解包，避免 Libbox 初始化返回 nil 时直接崩溃
+          edit('apple/Library/Network/CommandClient.swift',
+               '        let client = LibboxNewCommandClient(clientHandler(self), clientOptions)!\n        do {',
+               '        guard let client = LibboxNewCommandClient(clientHandler(self), clientOptions) else {\n            NSLog("CommandClient: LibboxNewCommandClient returned nil")\n            return\n        }\n        do {',
+               'CommandClient.swift (force unwrap)')
 
-          edit('apple/Library/Network/ExtensionProvider.swift',
-               '    private func startService() async {\n        let profile: Profile?\n',
-               '    private func startService() async {\n        FilePath.installBundledRuleSets()\n        let profile: Profile?\n',
-               'ExtensionProvider.swift')
-
-          edit('apple/SFT/ApplicationDelegate.swift',
-               '        LibboxSetup(options, &error)\n        LibboxSetLocale(Locale.current.identifier)',
-               '        LibboxSetup(options, &error)\n        FilePath.installBundledRuleSets()\n        LibboxSetLocale(Locale.current.identifier)',
-               'SFT/ApplicationDelegate.swift')
-
-          # 4) 修复 tvOS 16 点日志页闪退：focusEffectDisabled 是 tvOS 17 API
-          lv = pathlib.Path('apple/ApplicationLibrary/Views/Log/LogView.swift')
-          s = lv.read_text(encoding='utf-8')
-          if 'focusEffectDisabledCompat' not in s:
-              n = s.count('.focusEffectDisabled()')
-              assert n == 2, 'focusEffectDisabled count unexpected: ' + str(n)
-              lv.write_text(s.replace('.focusEffectDisabled()', '.focusEffectDisabledCompat()'), encoding='utf-8')
-              print('patched: LogView.swift (focusEffectDisabled -> compat)')
-
-          vc = pathlib.Path('apple/ApplicationLibrary/Views/Abstract/ViewCompat.swift')
-          s = vc.read_text(encoding='utf-8')
-          if 'focusEffectDisabledCompat' not in s:
-              if 'import Foundation' not in s:
-                  s = s.replace('import SwiftUI', 'import Foundation\nimport SwiftUI', 1)
-              helper = '\n'.join([
-                  '',
-                  'public extension View {',
-                  '    /// focusEffectDisabled \u662f tvOS 17 API\uff0c\u65e7\u7cfb\u7edf\u4e0a\u6309\u8fd0\u884c\u65f6\u7248\u672c\u8df3\u8fc7',
-                  '    @ViewBuilder',
-                  '    func focusEffectDisabledCompat() -> some View {',
-                  '        if ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 17, minorVersion: 0, patchVersion: 0)) {',
-                  '            focusEffectDisabled()',
-                  '        } else {',
-                  '            self',
-                  '        }',
-                  '    }',
-                  '}',
-                  '',
-              ])
-              vc.write_text(s.rstrip('\n') + '\n' + helper, encoding='utf-8')
-              print('patched: ViewCompat.swift (add focusEffectDisabledCompat)')
+          edit('apple/Library/Network/CommandClient.swift',
+               '                commandClient.clashModeList = modeList!.toArray()\n                commandClient.clashMode = currentMode!',
+               '                commandClient.clashModeList = modeList?.toArray() ?? []\n                commandClient.clashMode = currentMode ?? ""',
+               'CommandClient.swift (clash mode unwrap)')
 
           print('done')
           PY
           echo "--- patch check ---"
-          grep -c "installBundledRuleSets" apple/Library/Shared/FilePath.swift apple/Library/Network/ExtensionProvider.swift apple/SFT/ApplicationDelegate.swift
-          grep -c "focusEffectDisabledCompat" apple/ApplicationLibrary/Views/Log/LogView.swift apple/ApplicationLibrary/Views/Abstract/ViewCompat.swift
-          swiftc -typecheck apple/Library/Shared/FilePath.swift
-          swiftc -typecheck apple/ApplicationLibrary/Views/Abstract/ViewCompat.swift
+          grep -c "LogPage" apple/ApplicationLibrary/Views/Log/LogView.swift
+          grep -c "guard let client = LibboxNewCommandClient" apple/Library/Network/CommandClient.swift
+          grep -c "Logs (connected)" apple/ApplicationLibrary/Views/Log/LogView.swift
+          swiftc -parse apple/ApplicationLibrary/Views/Log/LogView.swift
 
       - name: Archive SFT (unsigned, tvOS 16.1 target)
         working-directory: apple
@@ -170,33 +164,6 @@ jobs:
               exit 1
             }
 
-      - name: Compile geoip-cn rule-set (APNIC -> .srs)
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd core && go build -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box)
-          for i in $(seq 1 12); do
-            curl -sL --max-time 90 -C - "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest" -o apnic.txt || true
-            SZ=$(stat -f%z apnic.txt 2>/dev/null || echo 0)
-            echo "apnic attempt $i size=$SZ"
-            if [ "$SZ" -gt 3000000 ]; then break; fi
-            sleep 2
-          done
-          python3 - <<'PY'
-          import ipaddress, json
-          nets=[]
-          for line in open('apnic.txt', errors='ignore'):
-              p=line.strip().split('|')
-              if len(p)<5 or p[1]!='CN' or p[2]!='ipv4': continue
-              s=ipaddress.IPv4Address(p[3]); c=int(p[4])
-              nets.extend(ipaddress.summarize_address_range(s, ipaddress.IPv4Address(int(s)+c-1)))
-          cidrs=[str(n) for n in ipaddress.collapse_addresses(nets)]
-          json.dump({'version':1,'rules':[{'ip_cidr':cidrs}]}, open('geoip-cn.json','w'), ensure_ascii=False)
-          print('CN CIDR count:', len(cidrs))
-          PY
-          "$RUNNER_TEMP/sing-box" rule-set compile geoip-cn.json -o geoip-cn.srs
-          ls -la geoip-cn.srs
-
       - name: Assemble IPA payload
         run: |
           set -euo pipefail
@@ -211,11 +178,7 @@ jobs:
           fi
           mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
-          # 规则集打进主 App 与扩展包，启动时由 Swift 侧复制到 Working 工作目录
-          test -f geoip-cn.srs
-          cp geoip-cn.srs ipa/Payload/sing-box.app/
-          cp geoip-cn.srs ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/
-          ls -la ipa/Payload/sing-box.app/geoip-cn.srs ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/geoip-cn.srs
+          # 国内 IP 段走配置内联（sing-box-tvos-j.json），不再打包规则集文件
           # ldid: 注入 entitlements 并 fakesign（TrollStore 保留 entitlements）
           brew install ldid
           ENT_APP="apple/SFT/SFT.entitlements"
@@ -302,12 +265,15 @@ jobs:
           assert '_DeviceDiscoveryUI_SwiftUI' not in strong, 'DeviceDiscovery 仍是强链接，tvOS 16.1 无法启动'
           print('OK: DeviceDiscovery 无强链接 (weak=%s)' % ('_DeviceDiscoveryUI_SwiftUI' in weak))
           PY
-          echo "--- 规则集打包检查 ---"
-          test -f ipa/Payload/sing-box.app/geoip-cn.srs
-          test -f ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/geoip-cn.srs
-          ls -la ipa/Payload/sing-box.app/geoip-cn.srs ipa/Payload/sing-box.app/PlugIns/TVExtension.appex/geoip-cn.srs
-          echo "--- 规则集格式检查（应为 SRS 二进制魔数）---"
-          head -c 3 ipa/Payload/sing-box.app/geoip-cn.srs | xxd
+          echo "--- 日志页补丁是否编进产物（关键，上次漏检导致重装无效）---"
+          HIT=$(grep -r -a -l "Logs (connected)" ipa/Payload || true)
+          echo "命中文件: ${HIT:-<none>}"
+          test -n "$HIT" || { echo "!! LogView 补丁未编进二进制"; exit 1; }
+          echo "--- CommandClient 防崩溃补丁 ---"
+          HIT2=$(grep -r -a -l "LibboxNewCommandClient returned nil" ipa/Payload || true)
+          echo "命中文件: ${HIT2:-<none>}"
+          test -n "$HIT2" || { echo "!! CommandClient 补丁未编进二进制"; exit 1; }
+          echo "OK: 两个 Swift 补丁均已编进产物"
 
       - name: Pack IPA (python zipfile, standard structure)
         run: |
