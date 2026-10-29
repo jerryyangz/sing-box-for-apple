@@ -466,7 +466,23 @@ jobs:
           HIT3=$(LC_ALL=C grep -r -a -l "感谢支持" ipa/Payload || true)
           echo "命中文件: ${HIT3:-<none>}"
           test -n "$HIT3" || { echo "!! 设置页横幅未编进二进制"; exit 1; }
-          NQR=$(grep -a -o "iVBORw0KGgo" ipa/Payload/sing-box.app/sing-box | wc -l | tr -d ' ')
+          # 用 python 字节级统计，不依赖 grep（BSD grep 对二进制超长行/多字节有坑，
+          # 且 set -o pipefail 下 grep 无匹配退出码 1 会直接中止 step）
+          NQR=$(/usr/bin/python3 - <<'PY'
+          import glob, os, sys
+          total = 0
+          for f in sorted(glob.glob('ipa/Payload/sing-box.app/**/*', recursive=True)):
+              if os.path.isfile(f) and not os.path.islink(f):
+                  try:
+                      c = open(f, 'rb').read().count(b'iVBORw0KGgo')
+                  except OSError:
+                      c = 0
+                  if c:
+                      sys.stderr.write('  %4d  %s\n' % (c, f))
+                  total += c
+          print(total)
+          PY
+          )
           echo "二进制中 PNG 常量前缀出现次数: $NQR (期望 >= 3)"
           test "$NQR" -ge 3 || { echo "!! 二维码图片数据缺失"; exit 1; }
           echo "--- 三个 Mach-O 的 minos ---"
